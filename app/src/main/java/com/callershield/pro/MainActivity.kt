@@ -2,15 +2,23 @@ package com.callershield.pro
 
 import android.Manifest
 import android.app.Activity
+import android.app.DownloadManager
 import android.app.role.RoleManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.database.Cursor
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.provider.CallLog
+import android.provider.Settings
+import android.text.format.DateFormat
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
@@ -22,12 +30,60 @@ import android.widget.Spinner
 import android.widget.ArrayAdapter
 import android.widget.TextView
 import android.widget.Toast
+import java.io.IOException
+import java.util.Date
 
 class MainActivity : Activity() {
     private val prefs by lazy { getSharedPreferences("caller_shield", Context.MODE_PRIVATE) }
     private lateinit var content: LinearLayout
+    private var updateStatusView: TextView? = null
     private var selectedTab = "Home"
     private var dialNumber = ""
+    private var updateStatus = "Check GitHub for the latest version."
+    private var downloadId: Long? = null
+    private var installPromptId: Long? = null
+    private var activityResumed = false
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val downloadPoller = object : Runnable {
+        override fun run() {
+            val id = downloadId ?: return
+            try {
+                val progress = AppUpdateManager.getDownloadProgress(this@MainActivity, id)
+                when (progress?.status) {
+                    DownloadManager.STATUS_PENDING,
+                    DownloadManager.STATUS_RUNNING,
+                    DownloadManager.STATUS_PAUSED -> {
+                        updateStatus = if (progress.percent > 0) {
+                            "Downloading update… ${progress.percent}%"
+                        } else {
+                            "Downloading update…"
+                        }
+                        updateStatusView?.text = updateStatus
+                        mainHandler.postDelayed(this, DOWNLOAD_POLL_INTERVAL)
+                    }
+                    DownloadManager.STATUS_SUCCESSFUL -> {
+                        downloadId = null
+                        prefs.edit().remove(KEY_ACTIVE_DOWNLOAD).putLong(KEY_READY_DOWNLOAD, id).apply()
+                        updateStatus = "Update downloaded. Android will ask you to confirm installation."
+                        render()
+                        if (activityResumed) promptInstall(id)
+                    }
+                    DownloadManager.STATUS_FAILED, null -> {
+                        downloadId = null
+                        prefs.edit().remove(KEY_ACTIVE_DOWNLOAD).apply()
+                        updateStatus = "Download failed. Check your connection and try again."
+                        render()
+                    }
+                }
+            } catch (error: IOException) {
+                Log.e(TAG, "Could not check update download status", error)
+                downloadId = null
+                prefs.edit().remove(KEY_ACTIVE_DOWNLOAD).apply()
+                updateStatus = "Could not check the download. Please try again."
+                render()
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -36,7 +92,19 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        if (::content.isInitialized) render()
+        activityResumed = true
+        if (::content.isInitialized) {
+            installPromptId = null
+            render()
+            resumePendingInstall()
+            resumeUpdateDownload()
+        }
+    }
+
+    override fun onPause() {
+        activityResumed = false
+        mainHandler.removeCallbacks(downloadPoller)
+        super.onPause()
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, results: IntArray) {
@@ -50,10 +118,15 @@ class MainActivity : Activity() {
                 Toast.LENGTH_LONG
             ).show()
             render()
+        } else if (requestCode == CALL_LOG_PERMISSION_REQUEST) {
+            val granted = results.isNotEmpty() && results[0] == PackageManager.PERMISSION_GRANTED
+            if (!granted) toast("Call log access denied; recent calls are hidden")
+            render()
         }
     }
 
     private fun render() {
+        updateStatusView = null
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(BACKGROUND)
@@ -103,10 +176,12 @@ class MainActivity : Activity() {
         stats.addView(statCard(reportCount.toString(), "Your reports"), LinearLayout.LayoutParams(0, -2, 1f))
         content.addView(stats, spaced(14, 0))
 
+        showRecentCalls()
+
         val shortcutCard = card()
         shortcutCard.addView(label("Quick actions", 19f, WHITE, true))
-        shortcutCard.addView(button("Report a spam caller").apply { setOnClickListener { selectedTab = "Reports"; render() } }, spaced(12, 0))
-        shortcutCard.addView(button("Open dialer").apply { setOnClickListener { selectedTab = "Dialer"; render() } }, spaced(8, 0))
+        shortcutCard.addView(button("⚑   Report a spam caller").apply { setOnClickListener { selectedTab = "Reports"; render() } }, spaced(12, 0))
+        shortcutCard.addView(button("☎   Open dialer").apply { setOnClickListener { selectedTab = "Dialer"; render() } }, spaced(8, 0))
         content.addView(shortcutCard, spaced(14, 0))
 
         val tip = card()
@@ -115,41 +190,198 @@ class MainActivity : Activity() {
         content.addView(tip, spaced(14, 0))
     }
 
+    private fun showRecentCalls() {
+        val history = card()
+        val heading = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        heading.addView(label("Recent calls", 19f, WHITE, true), LinearLayout.LayoutParams(0, -2, 1f))
+        heading.addView(label("CALL LOG", 10f, MUTED, true))
+        history.addView(heading)
+
+        if (checkSelfPermission(Manifest.permission.READ_CALL_LOG) != PackageManager.PERMISSION_GRANTED) {
+            history.addView(label(
+                "View your latest calls here. Call history stays on this device.",
+                14f, MUTED
+            ), spaced(8, 0))
+            history.addView(button("◷   Allow call log access").apply {
+                setOnClickListener {
+                    requestPermissions(arrayOf(Manifest.permission.READ_CALL_LOG), CALL_LOG_PERMISSION_REQUEST)
+                }
+            }, spaced(12, 0))
+        } else {
+            val result = loadRecentCalls()
+            when {
+                result.error != null -> history.addView(
+                    label(result.error, 14f, AMBER), spaced(8, 0)
+                )
+                result.calls.isEmpty() -> history.addView(
+                    label("No recent calls to show.", 14f, MUTED), spaced(8, 0)
+                )
+                else -> result.calls.forEachIndexed { index, call ->
+                    val row = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
+                        setPadding(0, dp(12), 0, dp(12))
+                    }
+                    val callIcon = label(call.icon, 20f, call.iconColor, true).apply {
+                        gravity = Gravity.CENTER
+                        background = rounded(BUTTON, 14)
+                        layoutParams = LinearLayout.LayoutParams(dp(42), dp(42)).apply {
+                            rightMargin = dp(12)
+                        }
+                    }
+                    row.addView(callIcon)
+
+                    val details = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                    details.addView(label(call.name.ifBlank { call.number.ifBlank { "Private number" } }, 15f, WHITE, true))
+                    details.addView(label("${call.type}  ·  ${call.date}", 12f, MUTED), spaced(4, 0))
+                    row.addView(details, LinearLayout.LayoutParams(0, -2, 1f))
+                    history.addView(row)
+                    if (index < result.calls.lastIndex) {
+                        history.addView(View(this).apply {
+                            setBackgroundColor(BUTTON)
+                            layoutParams = LinearLayout.LayoutParams(-1, dp(1))
+                        })
+                    }
+                }
+            }
+        }
+        content.addView(history, spaced(14, 0))
+    }
+
+    private fun loadRecentCalls(): CallHistoryResult {
+        val projection = arrayOf(
+            CallLog.Calls.NUMBER,
+            CallLog.Calls.CACHED_NAME,
+            CallLog.Calls.TYPE,
+            CallLog.Calls.DATE
+        )
+        return try {
+            val cursor = contentResolver.query(
+                CallLog.Calls.CONTENT_URI,
+                projection,
+                null,
+                null,
+                "${CallLog.Calls.DATE} DESC"
+            ) ?: return CallHistoryResult(error = "Could not read recent calls. Try again later.")
+            cursor.use { readRecentCalls(it) }
+        } catch (error: SecurityException) {
+            Log.e(TAG, "Call log access was denied", error)
+            CallHistoryResult(error = "Call log access is unavailable. Check app permissions in Settings.")
+        }
+    }
+
+    private fun readRecentCalls(cursor: Cursor): CallHistoryResult {
+        val calls = mutableListOf<RecentCall>()
+        val numberColumn = cursor.getColumnIndexOrThrow(CallLog.Calls.NUMBER)
+        val nameColumn = cursor.getColumnIndexOrThrow(CallLog.Calls.CACHED_NAME)
+        val typeColumn = cursor.getColumnIndexOrThrow(CallLog.Calls.TYPE)
+        val dateColumn = cursor.getColumnIndexOrThrow(CallLog.Calls.DATE)
+        while (cursor.moveToNext() && calls.size < RECENT_CALL_LIMIT) {
+            val type = cursor.getInt(typeColumn)
+            val callType = when (type) {
+                CallLog.Calls.INCOMING_TYPE -> RecentCall("Incoming", "↙", MINT)
+                CallLog.Calls.OUTGOING_TYPE -> RecentCall("Outgoing", "↗", MINT)
+                CallLog.Calls.MISSED_TYPE -> RecentCall("Missed", "↙", AMBER)
+                CallLog.Calls.REJECTED_TYPE -> RecentCall("Declined", "↙", AMBER)
+                CallLog.Calls.BLOCKED_TYPE -> RecentCall("Blocked", "⊘", AMBER)
+                else -> RecentCall("Call", "☎", MINT)
+            }
+            calls.add(callType.copy(
+                number = cursor.getString(numberColumn).orEmpty(),
+                name = cursor.getString(nameColumn).orEmpty(),
+                date = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+                    .format(Date(cursor.getLong(dateColumn)))
+            ))
+        }
+        return CallHistoryResult(calls = calls)
+    }
+
     private fun showDialer() {
         content.addView(label("DIALER", 12f, MUTED, true))
-        content.addView(label("Make a call", 27f, WHITE, true), spaced(4, 20))
-        content.addView(label("Calls are placed through your phone's system dialer.", 14f, MUTED), spaced(4, 18))
+        content.addView(label("Make a call", 27f, WHITE, true), spaced(4, 6))
+        content.addView(label("Calls are placed through your phone's system dialer.", 14f, MUTED), spaced(4, 16))
 
-        val number = label(dialNumber.ifEmpty { "Enter a number" }, 27f, if (dialNumber.isEmpty()) MUTED else WHITE)
-        number.gravity = Gravity.CENTER
-        number.setPadding(0, dp(18), 0, dp(18))
-        content.addView(number)
+        val numberCard = card()
+        numberCard.orientation = LinearLayout.HORIZONTAL
+        numberCard.gravity = Gravity.CENTER_VERTICAL
+        val number = label(dialNumber.ifEmpty { "Enter a number" }, 27f, if (dialNumber.isEmpty()) MUTED else WHITE, true).apply {
+            gravity = Gravity.CENTER
+            maxLines = 1
+            setSingleLine(true)
+            ellipsize = android.text.TextUtils.TruncateAt.START
+        }
+        numberCard.addView(number, LinearLayout.LayoutParams(0, dp(64), 1f))
+        val deleteButton = label("⌫", 22f, MUTED, true).apply {
+            gravity = Gravity.CENTER
+            contentDescription = "Delete last digit; long press to clear"
+            background = rounded(BUTTON, 16)
+            setOnClickListener {
+                dialNumber = dialNumber.dropLast(1)
+                updateDialedNumber(number)
+            }
+            setOnLongClickListener {
+                dialNumber = ""
+                updateDialedNumber(number)
+                true
+            }
+        }
+        numberCard.addView(deleteButton, LinearLayout.LayoutParams(dp(54), dp(48)).apply {
+            leftMargin = dp(8)
+        })
+        content.addView(numberCard, spaced(0, 14))
 
         val keypad = GridLayout(this).apply {
             columnCount = 3
             rowCount = 4
             useDefaultMargins = false
         }
-        val keys = listOf("1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#")
+        val keys = listOf(
+            "1" to "", "2" to "ABC", "3" to "DEF",
+            "4" to "GHI", "5" to "JKL", "6" to "MNO",
+            "7" to "PQRS", "8" to "TUV", "9" to "WXYZ",
+            "*" to "", "0" to "+", "#" to ""
+        )
         keys.forEach { key ->
-            val keyButton = button(key).apply {
-                textSize = 22f
+            val keyButton = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                background = rounded(CARD, 24)
+                isClickable = true
+                isFocusable = true
+                foreground = android.graphics.drawable.RippleDrawable(
+                    android.content.res.ColorStateList.valueOf(0x3371F2C2),
+                    null,
+                    rounded(WHITE, 24)
+                )
                 setOnClickListener {
-                    dialNumber += key
-                    number.text = dialNumber
+                    dialNumber += key.first
+                    updateDialedNumber(number)
                 }
+            }
+            keyButton.addView(label(key.first, 24f, WHITE, true).apply { gravity = Gravity.CENTER })
+            if (key.second.isNotEmpty()) {
+                keyButton.addView(label(key.second, 9f, MUTED, true).apply {
+                    gravity = Gravity.CENTER
+                    letterSpacing = 0.12f
+                })
+            } else {
+                keyButton.addView(label(" ", 9f, MUTED).apply { gravity = Gravity.CENTER })
             }
             keypad.addView(keyButton, GridLayout.LayoutParams().apply {
                 width = 0
-                height = dp(58)
+                height = dp(68)
                 columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
-                setMargins(dp(4), dp(4), dp(4), dp(4))
+                setMargins(dp(5), dp(5), dp(5), dp(5))
             })
         }
         content.addView(keypad, spaced(4, 0))
 
-        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        actions.addView(button("Call").apply {
+        val callButton = button("☎     Call").apply {
+            textSize = 18f
+            typeface = Typeface.DEFAULT_BOLD
             setBackgroundTintList(android.content.res.ColorStateList.valueOf(MINT))
             setTextColor(BACKGROUND)
             setOnClickListener {
@@ -160,16 +392,14 @@ class MainActivity : Activity() {
                     startActivity(Intent(Intent.ACTION_DIAL, Uri.fromParts("tel", value, null)))
                 }
             }
-        }, LinearLayout.LayoutParams(0, dp(52), 1f))
-        actions.addView(button("Delete").apply {
-            setOnClickListener {
-                dialNumber = dialNumber.dropLast(1)
-                number.text = dialNumber.ifEmpty { "Enter a number" }
-                number.setTextColor(if (dialNumber.isEmpty()) MUTED else WHITE)
-            }
-        }, LinearLayout.LayoutParams(0, dp(52), 1f).apply { leftMargin = dp(10) })
-        content.addView(actions, spaced(8, 0))
-        content.addView(label("Emergency calls should always be made using the system phone app.", 12f, MUTED), spaced(14, 0))
+        }
+        content.addView(callButton, spaced(10, 0).apply { height = dp(58) })
+        content.addView(label("Emergency calls should always be made using the system phone app.", 12f, MUTED), spaced(12, 0))
+    }
+
+    private fun updateDialedNumber(number: TextView) {
+        number.text = dialNumber.ifEmpty { "Enter a number" }
+        number.setTextColor(if (dialNumber.isEmpty()) MUTED else WHITE)
     }
 
     private fun showReports() {
@@ -249,6 +479,23 @@ class MainActivity : Activity() {
         ), spaced(4, 0))
         content.addView(switches, spaced(14, 0))
 
+        val updates = card()
+        updates.addView(label("App updates", 18f, WHITE, true))
+        updates.addView(label("Current version ${BuildConfig.VERSION_NAME}", 13f, MUTED), spaced(5, 0))
+        val statusView = label(updateStatus, 13f, MUTED)
+        updateStatusView = statusView
+        updates.addView(statusView, spaced(8, 0))
+        updates.addView(button("↻   Check for updates").apply {
+            setOnClickListener { checkForUpdates() }
+        }, spaced(12, 0))
+        val readyDownload = prefs.getLong(KEY_READY_DOWNLOAD, INVALID_DOWNLOAD_ID)
+        if (readyDownload != INVALID_DOWNLOAD_ID) {
+            updates.addView(button("Install downloaded update").apply {
+                setOnClickListener { promptInstall(readyDownload) }
+            }, spaced(8, 0))
+        }
+        content.addView(updates, spaced(14, 0))
+
         val list = card()
         list.addView(label("My block list", 18f, WHITE, true))
         val numbers = SpamStore.getNumbers(this)
@@ -281,27 +528,185 @@ class MainActivity : Activity() {
         content.addView(security, spaced(14, 0))
 
         content.addView(label(
-            "Privacy: block settings, block list, and reports are stored locally on this device. This app has no network permission and does not send reports to a shared community database.",
+            "Privacy: block settings, block list, and reports are stored locally on this device. Network access is used only to check for and download app updates; reports and contacts are never uploaded.",
             12f, MUTED
         ), spaced(12, 0))
+    }
+
+    private fun checkForUpdates() {
+        updateStatus = "Checking GitHub Releases…"
+        render()
+        Thread {
+            try {
+                val release = AppUpdateManager.findUpdate(BuildConfig.VERSION_NAME)
+                runOnUiThread {
+                    if (release == null) {
+                        updateStatus = "You're using the latest version."
+                        render()
+                    } else {
+                        android.app.AlertDialog.Builder(this)
+                            .setTitle("Update ${release.tag} available")
+                            .setMessage("Download the update from GitHub? Android will ask you to confirm installation.")
+                            .setNegativeButton("Cancel", null)
+                            .setPositiveButton("Download") { _, _ -> downloadUpdate(release) }
+                            .show()
+                    }
+                }
+            } catch (error: AppUpdateManager.NoPublishedReleaseException) {
+                runOnUiThread {
+                    updateStatus = error.message ?: "No GitHub release is available yet."
+                    render()
+                }
+            } catch (error: IOException) {
+                Log.e(TAG, "Could not check GitHub for updates", error)
+                runOnUiThread {
+                    updateStatus = error.message ?: "Could not check for updates. Try again."
+                    render()
+                }
+            }
+        }.start()
+    }
+
+    private fun downloadUpdate(release: AppRelease) {
+        try {
+            val id = AppUpdateManager.enqueueDownload(this, release)
+            downloadId = id
+            prefs.edit()
+                .putLong(KEY_ACTIVE_DOWNLOAD, id)
+                .remove(KEY_READY_DOWNLOAD)
+                .apply()
+            updateStatus = "Downloading update…"
+            render()
+            mainHandler.removeCallbacks(downloadPoller)
+            mainHandler.post(downloadPoller)
+        } catch (error: IOException) {
+            Log.e(TAG, "Could not start update download", error)
+            updateStatus = error.message ?: "Could not start the update download."
+            render()
+        } catch (error: SecurityException) {
+            Log.e(TAG, "Update download was not allowed", error)
+            updateStatus = "Android could not start the download. Check device settings."
+            render()
+        }
+    }
+
+    private fun resumeUpdateDownload() {
+        val id = prefs.getLong(KEY_ACTIVE_DOWNLOAD, INVALID_DOWNLOAD_ID)
+        if (id == INVALID_DOWNLOAD_ID) return
+        downloadId = id
+        mainHandler.removeCallbacks(downloadPoller)
+        mainHandler.post(downloadPoller)
+    }
+
+    private fun resumePendingInstall() {
+        val id = prefs.getLong(KEY_PENDING_INSTALL, INVALID_DOWNLOAD_ID)
+        if (id == INVALID_DOWNLOAD_ID) return
+        prefs.edit().remove(KEY_PENDING_INSTALL).apply()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && packageManager.canRequestPackageInstalls()) {
+            installDownloadedUpdate(id)
+        } else {
+            installPromptId = null
+            updateStatus = "Allow installs from Caller Shield in Android Settings, then tap Install downloaded update."
+            render()
+        }
+    }
+
+    private fun promptInstall(id: Long) {
+        if (installPromptId == id) return
+        installPromptId = id
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Allow app updates")
+                .setMessage("Allow Caller Shield to install updates from this source in Android Settings. Android will still ask you to confirm the installation.")
+                .setNegativeButton("Not now") { _, _ -> installPromptId = null }
+                .setPositiveButton("Open settings") { _, _ ->
+                    prefs.edit().putLong(KEY_PENDING_INSTALL, id).apply()
+                    startActivity(
+                        Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES)
+                            .setData(Uri.parse("package:$packageName"))
+                    )
+                }
+                .show()
+            return
+        }
+        installDownloadedUpdate(id)
+    }
+
+    private fun installDownloadedUpdate(id: Long) {
+        try {
+            val apkFile = AppUpdateManager.getDownloadedApkFile(this)
+            val archiveInfo = packageManager.getPackageArchiveInfo(apkFile.absolutePath, 0)
+                ?: throw IOException("The downloaded APK is invalid. Download the update again.")
+            if (archiveInfo.packageName != packageName) {
+                throw IOException("The downloaded APK is not Caller Shield Pro.")
+            }
+            val installedInfo = packageManager.getPackageInfo(packageName, 0)
+            val installedVersionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                installedInfo.longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                installedInfo.versionCode.toLong()
+            }
+            val archiveVersionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                archiveInfo.longVersionCode
+            } else {
+                @Suppress("DEPRECATION")
+                archiveInfo.versionCode.toLong()
+            }
+            if (archiveVersionCode <= installedVersionCode) {
+                throw IOException("The update APK must have a higher version code.")
+            }
+            val apkUri = AppUpdateManager.getDownloadedUri(this, id)
+                ?: throw IOException("Downloaded APK is unavailable. Download the update again.")
+            val installIntent = Intent(Intent.ACTION_VIEW)
+                .setDataAndType(apkUri, "application/vnd.android.package-archive")
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(installIntent)
+        } catch (error: IOException) {
+            Log.e(TAG, "Could not open downloaded update", error)
+            installPromptId = null
+            updateStatus = error.message ?: "Could not open the downloaded update."
+            render()
+        } catch (error: SecurityException) {
+            Log.e(TAG, "Android denied opening the update installer", error)
+            installPromptId = null
+            updateStatus = "Android blocked the installer. Check install permission in Settings."
+            render()
+        } catch (error: android.content.ActivityNotFoundException) {
+            Log.e(TAG, "No Android package installer is available", error)
+            installPromptId = null
+            updateStatus = "No package installer is available on this device."
+            render()
+        }
     }
 
     private fun buildNavigation(): LinearLayout {
         val nav = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(8), dp(8), dp(8), dp(8))
+            setPadding(dp(8), dp(6), dp(8), dp(6))
             setBackgroundColor(CARD)
         }
-        listOf("Home", "Dialer", "Reports", "Settings").forEach { tab ->
-            val item = TextView(this).apply {
-                text = tab
-                textSize = 12f
-                typeface = Typeface.DEFAULT_BOLD
+        listOf(
+            "Home" to "⌂",
+            "Dialer" to "☎",
+            "Reports" to "⚑",
+            "Settings" to "⚙"
+        ).forEach { (tab, icon) ->
+            val selected = selectedTab == tab
+            val item = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
                 gravity = Gravity.CENTER
-                setTextColor(if (selectedTab == tab) MINT else MUTED)
-                setPadding(dp(2), dp(10), dp(2), dp(10))
+                setPadding(dp(2), dp(6), dp(2), dp(6))
+                if (selected) background = rounded(0x263DE8B0, 14)
                 setOnClickListener { selectedTab = tab; render() }
             }
+            item.addView(label(icon, 19f, if (selected) MINT else MUTED, true).apply {
+                gravity = Gravity.CENTER
+            })
+            item.addView(label(tab, 11f, if (selected) MINT else MUTED, selected).apply {
+                gravity = Gravity.CENTER
+                setPadding(0, dp(2), 0, 0)
+            })
             nav.addView(item, LinearLayout.LayoutParams(0, -2, 1f))
         }
         return nav
@@ -409,8 +814,30 @@ class MainActivity : Activity() {
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
     private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
 
+    private data class RecentCall(
+        val type: String,
+        val icon: String,
+        val iconColor: Int,
+        val number: String = "",
+        val name: String = "",
+        val date: String = ""
+    )
+
+    private data class CallHistoryResult(
+        val calls: List<RecentCall> = emptyList(),
+        val error: String? = null
+    )
+
     private companion object {
         const val CONTACTS_PERMISSION_REQUEST = 41
+        const val CALL_LOG_PERMISSION_REQUEST = 42
+        const val RECENT_CALL_LIMIT = 8
+        const val DOWNLOAD_POLL_INTERVAL = 1_000L
+        const val INVALID_DOWNLOAD_ID = -1L
+        const val KEY_ACTIVE_DOWNLOAD = "active_update_download"
+        const val KEY_READY_DOWNLOAD = "ready_update_download"
+        const val KEY_PENDING_INSTALL = "pending_update_install"
+        const val TAG = "CallerShield"
         const val BACKGROUND = 0xFF0B1218.toInt()
         const val CARD = 0xFF14212A.toInt()
         const val BUTTON = 0xFF223640.toInt()

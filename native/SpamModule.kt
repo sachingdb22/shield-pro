@@ -11,7 +11,7 @@ class SpamModule(ctx: ReactApplicationContext) : ReactContextBaseJavaModule(ctx)
 
     @ReactMethod fun requestScreeningRole(pr: Promise) {
         val rm = reactApplicationContext.getSystemService(RoleManager::class.java)
-        val a = currentActivity
+        val a = reactApplicationContext.currentActivity
         if (a == null || !rm.isRoleAvailable(RoleManager.ROLE_CALL_SCREENING)) { pr.resolve(false); return }
         a.startActivityForResult(rm.createRequestRoleIntent(RoleManager.ROLE_CALL_SCREENING), 4242)
         pr.resolve(true)

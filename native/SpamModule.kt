@@ -25,6 +25,7 @@ class SpamModule(ctx: ReactApplicationContext) : ReactContextBaseJavaModule(ctx)
     @ReactMethod fun removeBlocked(n: String, pr: Promise) { p.edit().putStringSet("blocklist", set().apply { remove(n) }).apply(); pr.resolve(true) }
     @ReactMethod fun setBlockUnknown(v: Boolean, pr: Promise) { p.edit().putBoolean("blockUnknown", v).apply(); pr.resolve(true) }
     @ReactMethod fun getBlockUnknown(pr: Promise) { pr.resolve(p.getBoolean("blockUnknown", false)) }
+    @ReactMethod fun clearLog(pr: Promise) { p.edit().remove("log").apply(); pr.resolve(true) }
     @ReactMethod fun getLog(pr: Promise) {
         pr.resolve(Arguments.fromList((p.getStringSet("log", emptySet()) ?: emptySet()).sortedDescending()))
     }
